@@ -460,11 +460,13 @@ namespace {
 
 // Calculates the input queue size.
 size_t CalcMaxChunksIn(const std::vector<basecall::RunnerPtr> &model_runners) {
-    // Allow 2 batches per model runner on the chunks_in queue
+    // Allow one prefetched batch per model runner. Together with the batch being assembled or
+    // executed by each worker this provides double buffering without retaining a third batch of
+    // raw reads.
     size_t max_chunks_in = 0;
     // Allows optimal batch size to be used for every GPU
     for (auto &runner : model_runners) {
-        max_chunks_in += runner->batch_size() * 2;
+        max_chunks_in += runner->batch_size();
     }
     return max_chunks_in;
 }
@@ -500,6 +502,9 @@ BasecallerNode::BasecallerNode(std::vector<basecall::RunnerPtr> model_runners,
         }
         m_chunk_sizes.push_back(runner_ptr->chunk_size());
     }
+    if (m_chunk_sizes.empty()) {
+        throw std::runtime_error("BasecallerNode requires at least one chunk size.");
+    }
 
     auto high_priority_batch_timeout_env = getenv("HIGH_PRIORITY_BATCH_TIMEOUT");
     if (high_priority_batch_timeout_env) {
@@ -512,7 +517,8 @@ BasecallerNode::BasecallerNode(std::vector<basecall::RunnerPtr> model_runners,
     }
 
     m_processed_chunks.set_name("processed_chunks");
-    auto chunk_queue_size = CalcMaxChunksIn(m_model_runners) / m_chunk_sizes.size();
+    const auto chunk_queue_size =
+            std::max<size_t>(1, CalcMaxChunksIn(m_model_runners) / m_chunk_sizes.size());
     for (auto s : m_chunk_sizes) {
         auto &queue = m_chunk_in_queues.emplace_back(
                 std::make_unique<utils::AsyncQueue<std::unique_ptr<BasecallingChunk>>>(

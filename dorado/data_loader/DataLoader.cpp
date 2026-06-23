@@ -510,19 +510,34 @@ void DataLoader::load_pod5_reads_from_file_by_read_ids(const std::string& path,
         });
 
         const std::size_t num_rows = traversal_batch_counts[batch_index];
-        std::vector<std::future<SimplexReadPtr>> futures;
-        futures.reserve(num_rows);
-        for (std::size_t row_idx = 0; row_idx < num_rows; row_idx++) {
-            uint32_t row = traversal_batch_rows[row_idx + row_offset];
-            futures.push_back(m_thread_pool.push([row, batch_index, batch, file, &path, this] {
-                return process_pod5_thread_fn(row, batch_index, batch, file, path,
-                                              m_reads_by_channel, m_read_id_to_index,
-                                              m_allowed_read_ids, m_ignored_read_ids);
-            }));
+        // Keep the workers busy without retaining decoded signal for every row in the POD5 batch.
+        const std::size_t max_reads_in_flight =
+                std::max<std::size_t>(1, m_thread_pool.n_threads() * 2);
+        for (std::size_t group_start = 0; group_start < num_rows;) {
+            const std::size_t remaining_reads = m_max_reads - m_loaded_read_count;
+            const std::size_t group_size = std::min(max_reads_in_flight, remaining_reads);
+            if (group_size == 0) {
+                break;
+            }
+            const std::size_t group_end = std::min(group_start + group_size, num_rows);
+            std::vector<std::future<SimplexReadPtr>> futures;
+            futures.reserve(group_end - group_start);
+            for (std::size_t row_idx = group_start; row_idx < group_end; ++row_idx) {
+                uint32_t row = traversal_batch_rows[row_idx + row_offset];
+                futures.push_back(m_thread_pool.push([row, batch_index, batch, file, &path, this] {
+                    return process_pod5_thread_fn(row, batch_index, batch, file, path,
+                                                  m_reads_by_channel, m_read_id_to_index,
+                                                  m_allowed_read_ids, m_ignored_read_ids);
+                }));
+            }
+            group_start = group_end;
+            wait_and_process_futures(std::move(futures));
+            if (m_loaded_read_count == m_max_reads ||
+                m_stop_loading.load(std::memory_order_relaxed)) {
+                break;
+            }
         }
         row_offset += num_rows;
-
-        wait_and_process_futures(std::move(futures));
     }
 }
 
@@ -567,18 +582,32 @@ void DataLoader::load_pod5_reads_from_file(const std::string& path) {
         }
         batch_row_count = std::min(batch_row_count, m_max_reads - m_loaded_read_count);
 
-        std::vector<std::future<SimplexReadPtr>> futures;
-
-        futures.reserve(batch_row_count);
-        for (std::size_t row = 0; row < batch_row_count; ++row) {
-            futures.push_back(m_thread_pool.push([row, batch_index, batch, file, &path, this] {
-                return process_pod5_thread_fn(row, batch_index, batch, file, path,
-                                              m_reads_by_channel, m_read_id_to_index,
-                                              m_allowed_read_ids, m_ignored_read_ids);
-            }));
+        // Keep the workers busy without retaining decoded signal for every row in the POD5 batch.
+        const std::size_t max_reads_in_flight =
+                std::max<std::size_t>(1, m_thread_pool.n_threads() * 2);
+        for (std::size_t group_start = 0; group_start < batch_row_count;) {
+            const std::size_t remaining_reads = m_max_reads - m_loaded_read_count;
+            const std::size_t group_size = std::min(max_reads_in_flight, remaining_reads);
+            if (group_size == 0) {
+                break;
+            }
+            const std::size_t group_end = std::min(group_start + group_size, batch_row_count);
+            std::vector<std::future<SimplexReadPtr>> futures;
+            futures.reserve(group_end - group_start);
+            for (std::size_t row = group_start; row < group_end; ++row) {
+                futures.push_back(m_thread_pool.push([row, batch_index, batch, file, &path, this] {
+                    return process_pod5_thread_fn(row, batch_index, batch, file, path,
+                                                  m_reads_by_channel, m_read_id_to_index,
+                                                  m_allowed_read_ids, m_ignored_read_ids);
+                }));
+            }
+            group_start = group_end;
+            wait_and_process_futures(std::move(futures));
+            if (m_loaded_read_count == m_max_reads ||
+                m_stop_loading.load(std::memory_order_relaxed)) {
+                break;
+            }
         }
-
-        wait_and_process_futures(std::move(futures));
     }
 }
 

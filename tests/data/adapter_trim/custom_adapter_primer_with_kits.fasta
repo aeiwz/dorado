@@ -1,8 +1,0 @@
->adapter1_front	et:Z:adapter	sk:Z:test_kit1,test_kit2
-AGGGAACT
->adapter1_rear	et:Z:adapter	sk:Z:test_kit1,test_kit2
-AGTTCC
->primer1_front	et:Z:primer	sk:Z:test_kit1,test_kit2
-TGCGAAT
->primer1_rear	et:Z:primer	sk:Z:test_kit1,test_kit2
-CAGAGGTC

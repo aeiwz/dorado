@@ -15,6 +15,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace {
@@ -62,20 +63,26 @@ void create_simplex_pipeline(PipelineDescriptor& pipeline_desc,
 
     const bool is_rna = is_rna_model(model_config);
     NodeHandle first_node_handle = PipelineDescriptor::InvalidNodeHandle;
+    // BasecallerNode already retains an executing batch and a prefetched batch per runner. Keep
+    // only a small concurrency-scaled number of full raw reads in the upstream queues.
+    const int pre_basecall_threads = std::max(
+            scaler_node_threads, (enable_read_splitter && is_rna) ? splitter_node_threads : 0);
+    const size_t pre_basecall_queue_size =
+            std::clamp<size_t>(size_t(std::max(1, pre_basecall_threads)) * 4, 64, 1000);
 
     // For RNA model, read splitting happens first before any basecalling.
     if (enable_read_splitter && is_rna) {
         splitter::RNASplitSettings rna_splitter_settings;
         auto rna_splitter =
                 std::make_unique<const splitter::RNAReadSplitter>(rna_splitter_settings);
-        auto rna_splitter_node = pipeline_desc.add_node<ReadSplitNode>({}, std::move(rna_splitter),
-                                                                       splitter_node_threads, 1000);
+        auto rna_splitter_node = pipeline_desc.add_node<ReadSplitNode>(
+                {}, std::move(rna_splitter), splitter_node_threads, pre_basecall_queue_size);
         first_node_handle = rna_splitter_node;
     }
 
-    auto scaler_node =
-            pipeline_desc.add_node<ScalerNode>({}, model_config.signal_norm_params,
-                                               model_config.sample_type, scaler_node_threads, 1000);
+    auto scaler_node = pipeline_desc.add_node<ScalerNode>(
+            {}, model_config.signal_norm_params, model_config.sample_type, scaler_node_threads,
+            pre_basecall_queue_size);
     if (first_node_handle != PipelineDescriptor::InvalidNodeHandle) {
         pipeline_desc.add_node_sink(first_node_handle, scaler_node);
     } else {
@@ -84,8 +91,8 @@ void create_simplex_pipeline(PipelineDescriptor& pipeline_desc,
     NodeHandle current_node_handle = scaler_node;
 
     auto basecaller_node = pipeline_desc.add_node<BasecallerNode>(
-            {}, std::move(runners), overlap, model_config.model_name(), 1000, "BasecallerNode",
-            mean_qscore_start_pos);
+            {}, std::move(runners), overlap, model_config.model_name(), pre_basecall_queue_size,
+            "BasecallerNode", mean_qscore_start_pos);
     pipeline_desc.add_node_sink(current_node_handle, basecaller_node);
     current_node_handle = basecaller_node;
 

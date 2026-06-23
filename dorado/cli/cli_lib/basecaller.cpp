@@ -117,6 +117,7 @@ struct BasecallerOptions {
     int max_reads;
     int min_qscore;
     int run_for;
+    int cpu_runners;
     std::optional<int> modified_bases_batchsize;
     std::optional<float> modified_bases_threshold;
 
@@ -275,6 +276,12 @@ void set_dorado_basecaller_args(argparse::ArgumentParser& parser, int& verbosity
                 .default_value(default_parameters.chunksize)
                 .scan<'i', int>();
         parser.add_argument("--disable-variable-chunk-sizes").flag().hidden();
+        parser.add_argument("--cpu-runners")
+                .help("Run this many CPU basecall workers alongside the selected GPU device. "
+                      "Chunks are dynamically assigned to whichever worker becomes available. "
+                      "Each worker loads a separate copy of the model.")
+                .default_value(0)
+                .scan<'i', int>();
         parser.add_argument("--overlap")
                 .hidden()
                 .help("The number of samples overlapping neighbouring chunks.")
@@ -466,6 +473,32 @@ Runners create_runners(const BasecallerOptions& options,
                         num_runners, 0);
         return basecaller_runners;
     };
+    auto append_cpu_runners = [&](BasecallerRunners& basecaller_runners) {
+        if (options.device == "cpu" || options.cpu_runners == 0) {
+            return;
+        }
+
+        auto cpu_config = model_config;
+        constexpr int kHybridCpuBatchSize = 64;
+        cpu_config.basecaller.set_batch_size(kHybridCpuBatchSize);
+        cpu_config.normalise_basecaller_params();
+        auto cpu_result = api::create_basecall_runners(
+                {
+                        .model_config = cpu_config,
+                        .device = "cpu",
+                        .memory_limit_fraction = 1.f,
+                        .pipeline_type = api::PipelineType::simplex,
+                        .batch_size_time_penalty = 0.f,
+                        .variable_chunk_sizes = false,
+                },
+                0, size_t(options.cpu_runners));
+        auto& cpu_runners = cpu_result.first;
+        basecaller_runners.runners.insert(basecaller_runners.runners.end(),
+                                          std::make_move_iterator(cpu_runners.begin()),
+                                          std::make_move_iterator(cpu_runners.end()));
+        spdlog::info("Enabled hybrid basecalling with {} CPU runner(s), CPU batch size {}",
+                     options.cpu_runners, kHybridCpuBatchSize);
+    };
 
     BasecallerRunners basecaller_runners;
 #if DORADO_CUDA_BUILD
@@ -485,14 +518,14 @@ Runners create_runners(const BasecallerOptions& options,
         }
 
         const bool use_variable_chunk_sizes =
-                options.variable_chunk_sizes &&
+                options.cpu_runners == 0 && options.variable_chunk_sizes &&
                 api::check_variable_chunk_sizes_supported(model_config, device_ids);
 
         cxxpool::thread_pool pool{gpu_fractions.size()};
         std::vector<std::future<BasecallerRunners>> futures;
         futures.reserve(gpu_fractions.size());
         for (const auto& [device_id, fraction] : gpu_fractions) {
-            futures.push_back(pool.push([&] {
+            futures.push_back(pool.push([&, device_id, fraction] {
                 return create_device_runners(device_id, fraction, use_variable_chunk_sizes);
             }));
         }
@@ -516,6 +549,7 @@ Runners create_runners(const BasecallerOptions& options,
         basecaller_runners = create_device_runners(options.device, memory_limit_fraction,
                                                    use_variable_chunk_sizes);
     }
+    append_cpu_runners(basecaller_runners);
 
     return {
             .num_devices = basecaller_runners.num_devices,
@@ -1163,6 +1197,15 @@ int basecaller(int argc, char* argv[]) {
         spdlog::error("Invalid value for --run-for: {}", run_for_arg);
         return EXIT_FAILURE;
     }
+    const auto cpu_runners = parser.get<int>("--cpu-runners");
+    if (cpu_runners < 0) {
+        spdlog::error("Invalid value for --cpu-runners: {}", cpu_runners);
+        return EXIT_FAILURE;
+    }
+    if (device == "cpu" && cpu_runners != 0) {
+        spdlog::error("--cpu-runners requires a GPU device; use --device cpu for CPU-only calling");
+        return EXIT_FAILURE;
+    }
 
     const auto emit_args = cli::get_emit_args(parser);
     const auto& alignment_reference = parser.get<std::string>("--reference");
@@ -1185,6 +1228,7 @@ int basecaller(int argc, char* argv[]) {
                 .max_reads = parser.get<int>("--max-reads"),
                 .min_qscore = parser.get<int>("--min-qscore"),
                 .run_for = run_for_arg,
+                .cpu_runners = cpu_runners,
                 .modified_bases_batchsize = parser.present<int>("--modified-bases-batchsize"),
                 .modified_bases_threshold = parser.present<float>("--modified-bases-threshold"),
                 .enable_read_splitting = !parser.get<bool>("--disable-read-splitting"),

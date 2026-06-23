@@ -12,6 +12,8 @@
 #include <ATen/ops/from_blob.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <stdexcept>
 
@@ -148,7 +150,8 @@ std::vector<int32_t> get_max_ins_for_window(const std::vector<OverlapWindow>& ov
 std::tuple<at::Tensor, at::Tensor> get_features_for_window(
         const std::vector<OverlapWindow>& overlaps,
         const CorrectionAlignments& alignments,
-        const std::vector<int32_t>& max_ins) {
+        const std::vector<int32_t>& max_ins,
+        const std::vector<int32_t>& pileup_offsets) {
     if (std::empty(overlaps)) {
         return {};
     }
@@ -162,7 +165,7 @@ std::tuple<at::Tensor, at::Tensor> get_features_for_window(
     auto bases_options = at::TensorOptions().dtype(at::kInt).device(at::kCPU);
     auto quals_options = at::TensorOptions().dtype(at::kFloat).device(at::kCPU);
 
-    const int length = std::accumulate(max_ins.begin(), max_ins.end(), 0) + (int)max_ins.size();
+    const int length = pileup_offsets.back();
     const int reads = 1 + TOP_K;
 
     auto bases = at::empty({reads, length}, bases_options);
@@ -175,18 +178,17 @@ std::tuple<at::Tensor, at::Tensor> get_features_for_window(
     const std::string& tseq = alignments.read_seq;
     const std::vector<uint8_t>& tqual = alignments.read_qual;
 
-    int tpos = 0;
     int* target_bases_tensor = bases.data_ptr<int>();
     std::fill(target_bases_tensor, target_bases_tensor + length, base_encoding['*']);
     float* target_quals_tensor = quals.data_ptr<float>();
     // PyTorch stores data in column major format.
     for (int i = 0; i < win_len; i++) {
+        const int tpos = pileup_offsets[i];
         target_bases_tensor[tpos] = base_encoding[tseq[i + win_tstart]];
         target_quals_tensor[tpos] = normalize_quals(float(tqual[i + win_tstart] + 33));
 
         LOG_TRACE("tpos {} base {} qual {}", tpos, base_decoding[target_bases_tensor[tpos]],
                   target_quals_tensor[tpos]);
-        tpos += 1 + max_ins[i];
     }
 
     // Write bases for each overlap in the window
@@ -247,8 +249,8 @@ std::tuple<at::Tensor, at::Tensor> get_features_for_window(
 
         std::fill(query_bases_tensor, query_bases_tensor + length, base_encoding[gap]);
 
-        tpos = offset;
-        int idx = offset + std::accumulate(max_ins.begin(), max_ins.begin() + offset, 0);
+        int tpos = offset;
+        int idx = pileup_offsets[offset];
 
         LOG_TRACE("cigar_len {}, cigar_end {}, gap {}, tpos {}, idx {}, fwd {}", cigar_len,
                   cigar_end, gap, tpos, idx, fwd ? '+' : '-');
@@ -346,9 +348,8 @@ std::tuple<at::Tensor, at::Tensor> get_features_for_window(
 std::vector<std::pair<int, int>> get_supported(at::Tensor& bases) {
     std::vector<std::pair<int, int>> supported;
 
-    static auto base_forward = base_forward_mapping();
     static auto base_encoding = gen_base_encoding();
-    static auto base_decoding = gen_base_decoding();
+    static constexpr std::array<uint8_t, 10> canonical_base = {0, 1, 2, 3, 4, 0, 1, 2, 3, 4};
 
     const int reads = static_cast<int>(bases.sizes()[0]);
     const int length = static_cast<int>(bases.sizes()[1]);
@@ -356,7 +357,7 @@ std::vector<std::pair<int, int>> get_supported(at::Tensor& bases) {
     auto bases_ptr = bases.data_ptr<int>();
 
     int tpos = -1, ins = 0;
-    std::array<int, 128> counter;
+    std::array<int, 5> counter;
     for (int c = 0; c < length; c++) {
         if (bases_ptr[c] == base_encoding['*']) {
             ins += 1;
@@ -371,11 +372,11 @@ std::vector<std::pair<int, int>> get_supported(at::Tensor& bases) {
             if (base == base_encoding['.']) {
                 continue;
             }
-            counter[base_forward[base_decoding[base]]]++;
+            counter[canonical_base[base]]++;
         }
 
-        LOG_TRACE("col {} A {} C {} T {} G {} * {}", c, counter['A'], counter['C'], counter['T'],
-                  counter['G'], counter['*']);
+        LOG_TRACE("col {} A {} C {} T {} G {} * {}", c, counter[0], counter[1], counter[3],
+                  counter[2], counter[4]);
         int count = (int)std::count_if(counter.begin(), counter.end(),
                                        [](int num) { return num >= 3; });
         if (count >= 2) {
@@ -389,20 +390,12 @@ std::vector<std::pair<int, int>> get_supported(at::Tensor& bases) {
 
 // Convert the tuple of pairs for {target pos, insertion offset} into a
 // column in the tensor.
-at::Tensor get_indices(const at::Tensor& bases, const std::vector<std::pair<int, int>>& supported) {
-    static auto base_encoding = gen_base_encoding();
-    auto tbase_tensor = bases.data_ptr<int>();
-    std::vector<int> indices;
-    for (int i = 0; i < bases.sizes()[1]; i++) {
-        if (tbase_tensor[i] != base_encoding['*']) {
-            indices.push_back(i);
-        }
-    }
-
+at::Tensor get_indices(const std::vector<std::pair<int, int>>& supported,
+                       const std::vector<int32_t>& pileup_offsets) {
     std::vector<int> supported_indices;
     supported_indices.reserve(supported.size());
     for (auto [pos, ins] : supported) {
-        supported_indices.push_back(indices[pos] + ins);
+        supported_indices.push_back(pileup_offsets[pos] + ins);
     }
 
     return at::from_blob(supported_indices.data(), {(int)supported_indices.size()},
@@ -422,6 +415,7 @@ std::unordered_set<int> filter_features(std::vector<std::vector<OverlapWindow>>&
 
         // Filter overlaps with very large indels
         std::vector<OverlapWindow> filtered_overlaps;
+        filtered_overlaps.reserve(overlap_windows.size());
         for (auto& ovlp : overlap_windows) {
             if (!overlap_has_long_indel(ovlp, alignments, MAX_INDEL_LEN)) {
                 filtered_overlaps.push_back(std::move(ovlp));
@@ -473,6 +467,7 @@ std::unordered_set<int> filter_features(std::vector<std::vector<OverlapWindow>>&
 std::vector<WindowFeatures> extract_features(std::vector<std::vector<OverlapWindow>>& windows,
                                              const CorrectionAlignments& alignments) {
     std::vector<WindowFeatures> wfs;
+    wfs.reserve(windows.size());
     for (int w = 0; w < (int)windows.size(); w++) {
         LOG_TRACE("win idx {}", w);
         auto& overlap_windows = windows[w];
@@ -485,15 +480,20 @@ std::vector<WindowFeatures> extract_features(std::vector<std::vector<OverlapWind
             // Find the maximum insert size
             const std::vector<int32_t> max_ins =
                     get_max_ins_for_window(overlap_windows, alignments);
+            std::vector<int32_t> pileup_offsets(max_ins.size() + 1);
+            for (size_t i = 0; i < max_ins.size(); ++i) {
+                pileup_offsets[i + 1] = pileup_offsets[i] + max_ins[i] + 1;
+            }
 
             // Create tensors
-            auto [bases, quals] = get_features_for_window(overlap_windows, alignments, max_ins);
+            auto [bases, quals] =
+                    get_features_for_window(overlap_windows, alignments, max_ins, pileup_offsets);
             auto supported = get_supported(bases);
             wf.bases = std::move(bases);
             wf.quals = std::move(quals);
             wf.supported = std::move(supported);
             wf.length = (int)wf.supported.size();
-            wf.indices = get_indices(wf.bases, wf.supported);
+            wf.indices = get_indices(wf.supported, pileup_offsets);
         }
         wfs.push_back(std::move(wf));
     }
